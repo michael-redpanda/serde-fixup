@@ -10,6 +10,7 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.errors.SerializationException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -63,56 +64,155 @@ public class SerdeFixup {
         return rv;
     }
 
-    /**
-     * This function runs it all
-     */
-    public void run() {
-        logger.info("Running");
-        try {
-            logger.info("Fetching schema metadata for " + this.subject);
-            SchemaMetadata mainSchemaMetadata = this.schemaRegistryClient.getLatestSchemaMetadata(this.subject);
-            logger.info("Schema data for " + this.subject + ": " + mainSchemaMetadata);
-            ParsedSchema mainSchema = this.schemaRegistryClient.getSchemaById(mainSchemaMetadata.getId());
-            logger.info("Parsed schema " + mainSchema);
-            logger.info("Parsed schema canonical: " + mainSchema.canonicalString());
-            
-            logger.info("Fetching all references");
-            Map<String, String> resolvedReferences = this.resolveReferencesFully(mainSchemaMetadata);
-            logger.info("resolved References:\n" + resolvedReferences);
+    private Map<String, String> resolveReferencesFully() throws IOException, RestClientException {
+        return this.resolveReferencesFully(this.getSchemaMetadata());
+    }
 
-            logger.info("Creating protobuf schema");
-            ProtobufSchema pschema = new ProtobufSchema(mainSchema.canonicalString(), mainSchema.references(), resolvedReferences, mainSchema.version(), mainSchema.name());
-            logger.info("Creating descriptor");
-            Descriptors.Descriptor descriptor = pschema.toDescriptor();
-            
-            logger.info("Creating builder");
-            DynamicMessage.Builder mb = DynamicMessage.newBuilder(descriptor);
+    private void uploadNewSchema(ParsedSchema schema) throws IOException, RestClientException {
+        logger.trace("uploadNewSchema");
+        int id = this.schemaRegistryClient.register(this.subject, schema);
+        logger.info("New schema: " + id);
+    }
 
-            logger.info("Creating producer");
-            Producer<String, DynamicMessage> producer = new KafkaProducer<>(this.props);
+    private SchemaMetadata getSchemaMetadata() throws IOException, RestClientException {
+        logger.trace("getSchemaMetadata");
+        SchemaMetadata md = this.schemaRegistryClient.getLatestSchemaMetadata(this.subject);
+        logger.debug("Schema:\n" + md.getSchema());
+        logger.debug("References:\n" + md.getReferences());
+        return md;
+    }
 
-            logger.info("Creating record");
+    private ParsedSchema getParsedSchema() throws IOException, RestClientException {
+        return this.getParsedSchema(this.getSchemaMetadata());
+    }
+
+    private ParsedSchema getParsedSchema(SchemaMetadata md)  throws IOException, RestClientException {
+        logger.trace("getParsedSchema");
+        ParsedSchema ps = this.schemaRegistryClient.getSchemaById(md.getId());
+        logger.debug("Parsed schema:\n" + ps.canonicalString());
+        return ps;
+    }
+
+    private ProtobufSchema getProtobufSchema() throws IOException, RestClientException {
+        return this.getProtobufSchema(this.getSchemaMetadata(), this.getParsedSchema());
+    }
+
+
+    private ProtobufSchema getProtobufSchema(SchemaMetadata md, ParsedSchema pschema) throws IOException, RestClientException {
+        return this.getProtobufSchema(pschema, this.resolveReferencesFully(md));
+    }
+
+    private ProtobufSchema getProtobufSchema(ParsedSchema pschema, Map<String, String> resolvedReferences) throws IOException, RestClientException {
+        logger.trace("getProtobufSchema");
+        return new ProtobufSchema(pschema.canonicalString(), pschema.references(), resolvedReferences, pschema.version(), pschema.name());
+    }
+
+    private void sendMessage(Descriptors.Descriptor descriptor) throws SerializationException {
+        logger.trace("sendMessage");
+        DynamicMessage.Builder mb = DynamicMessage.newBuilder(descriptor);
+        try (Producer<String, DynamicMessage> producer = new KafkaProducer<>(this.props)) {
             ProducerRecord<String, DynamicMessage> record = new ProducerRecord<>(this.topic, "key", mb.build());
-
-            logger.info("Producing");
             producer.send(record, (metadata, exception) -> {
-                logger.info("Record sent");
                 if (exception == null) {
                     logger.info("Sent message to " + metadata.topic() + " partition " + metadata.partition() + " @ offset " + metadata.offset());
                 } else {
                     logger.error("Error sending message", exception);
                 }
             });
-            logger.info("Closing producer");
-            producer.close();
-            
-        } catch(IOException e) {
-            logger.error("I/O Exception", e);
+        }
+    }
+
+    public void run() {
+        logger.info("Starting run...");
+        ProtobufSchema pschema = null;
+        
+        try {
+            logger.debug("Fetching descriptor for " + this.subject);
+            pschema = getProtobufSchema();
+        } catch (IOException e) {
+            logger.error("Failed I/O exception getting descriptor for " + this.subject, e);
             return;
         } catch(RestClientException e) {
-            logger.error("Error fetching schema metadata", e);
+            logger.error("Failed with Rest client error for " + this.subject, e); 
             return;
         }
-        logger.info("Run completed");
+
+        logger.debug("pschema: " + pschema);
+        Descriptors.Descriptor descriptor = pschema.toDescriptor();
+
+        logger.debug("descriptor: " + descriptor);
+
+        var success = false;
+        var reloadSchema = false;
+        try {
+            logger.debug("Sending message");
+            this.sendMessage(descriptor);
+            logger.info("Successfully sent message");
+            success = true;
+        }catch(SerializationException e) {
+            success = false;
+            if (e.getCause() instanceof RestClientException restError) {
+                if (40403 == restError.getErrorCode()) {
+                    logger.warn("Failed to produce data due to subject not found");
+                    reloadSchema = true;
+                } else {
+                    logger.warn("RestClientException on produce to " + this.subject, restError);
+                }
+            } else {
+                logger.warn("SerializationException to " + this.subject, e);
+            }
+        }
+
+        if (success) {
+            logger.info("Successful run for " + this.subject);
+            return;
+        } else if (!reloadSchema) {
+            logger.warn("Failed to produce but not a reload event for " + this.subject);
+            return;
+        }
+
+        logger.info("Uploading new schema");
+        try {
+            this.uploadNewSchema(this.getParsedSchema());
+        } catch (IOException e) {
+            logger.error("Failed I/O exception uploading new schema for " + this.subject, e);
+            return;
+        } catch(RestClientException e) {
+            logger.error("Failed with Rest client error uploading new schema for " + this.subject, e); 
+            return;
+        }
+
+        logger.info("Succesfully uploaded new schema, retyring produce");
+
+        try {
+            logger.debug("Fetching descriptor for " + this.subject);
+            descriptor = getProtobufSchema().toDescriptor();
+        } catch (IOException e) {
+            logger.error("Failed I/O exception getting descriptor for " + this.subject, e);
+            return;
+        } catch(RestClientException e) {
+            logger.error("Failed with Rest client error for " + this.subject, e); 
+            return;
+        }
+
+        try {
+            logger.debug("Sending message");
+            this.sendMessage(descriptor);
+            logger.info("Successfully sent message with new schema!");
+            return;
+        }catch(SerializationException e) {
+            if (e.getCause() instanceof RestClientException restError) {
+                if (40403 == restError.getErrorCode()) {
+                    logger.warn("Failed to produce data due to subject not found");
+                    reloadSchema = true;
+                } else {
+                    logger.warn("RestClientException on produce to " + this.subject, restError);
+                }
+            } else {
+                logger.warn("SerializationException to " + this.subject, e);
+            }
+        }
+
+        logger.error("Failed to produce with new schema for " + this.subject);
     }
 }
