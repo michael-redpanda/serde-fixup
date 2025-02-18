@@ -43,6 +43,7 @@ public class SerdeFixup {
         // Use the latest schema version from Schema Registry
         this.props.put("auto.register.schemas", "false");
         this.props.put("use.latest.version", "true");
+        this.props.put("latest.compatibility.strict", "false");
         this.schemaRegistryClient = new CachedSchemaRegistryClient(schemaRegistryUrl, 20, Collections.singletonList(new ProtobufSchemaProvider()), null);
         this.topic = topic;
         this.subject = this.topic + "-value";
